@@ -1338,6 +1338,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         metrics = {f'{metric_key_prefix}_{key}': sum(val) / len(val) for key, val in self._metrics['eval'].items()}
         output.metrics.update(metrics)
         self.eval_flag = True
+        self._log_completions()
         return output
 
     def training_step(self, model: nn.Module, inputs: InputsType, num_items_in_batch=None) -> torch.Tensor:
@@ -1537,6 +1538,22 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             super().log(logs)
         self._metrics[mode].clear()
 
+        if self.accelerator.is_main_process and self.log_completions:
+            table = {
+                'step': [str(self.state.global_step)] * len(self._textual_logs['prompt']),
+                'prompt': self._textual_logs['prompt'],
+                'completion': self._textual_logs['completion'],
+                **self._textual_logs['rewards'],
+            }
+            self.jsonl_writer.append(table)
+            if self.args.report_to and 'wandb' in self.args.report_to and wandb.run is not None:
+                import pandas as pd
+                df = pd.DataFrame(table)
+                if self.wandb_log_unique_prompts:
+                    df = df.drop_duplicates(subset=['prompt'])
+                wandb.log({'completions': wandb.Table(dataframe=df)})
+
+    def _log_completions(self):
         if self.accelerator.is_main_process and self.log_completions:
             table = {
                 'step': [str(self.state.global_step)] * len(self._textual_logs['prompt']),
