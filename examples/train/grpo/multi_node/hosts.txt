@@ -1,0 +1,4 @@
+# List of node IPs or hostnames, one per line
+# First entry will be used as MASTER_ADDR
+192.168.1.1
+192.168.1.2
