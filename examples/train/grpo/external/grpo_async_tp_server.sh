@@ -67,6 +67,18 @@ parse_args() {
 
 parse_args "$@"
 
+# 添加调试信息
+echo "解析后的命令行参数:"
+echo "  PER_DEV_TRAIN_BS: $PER_DEV_TRAIN_BS"
+echo "  GRAD_ACC: $GRAD_ACC"
+echo "  PER_DEV_EVAL_BS: $PER_DEV_EVAL_BS"
+echo "  NUM_GENERATIONS: $NUM_GENERATIONS"
+echo "  TP_SIZE: $TP_SIZE"
+echo "  NUM_INFER_WORKERS: $NUM_INFER_WORKERS"
+echo "  GRPO_MODE: $GRPO_MODE"
+echo "  DEEPSPEED: $DEEPSPEED"
+echo "  DDP_TIMEOUT: $DDP_TIMEOUT"
+
 # Default values
 PER_DEV_TRAIN_BS=${PER_DEV_TRAIN_BS:-1}
 GRAD_ACC=${GRAD_ACC:-1}
@@ -118,6 +130,11 @@ if [ "$NUM_INFER_WORKERS" -eq "$TOTAL_GPUS_COUNT" ]; then
     TRAIN_CUDA_LIST="$AVAILABLE_GPUS"
     VLLM_DEVICE="auto"
     ASYNC_GENERATE="false"
+    echo "=== Using COLOCATE mode ==="
+    echo "  - Training and inference share all GPUs"
+    echo "  - TRAIN_CUDA_LIST: $TRAIN_CUDA_LIST"
+    echo "  - VLLM_DEVICE: auto"
+    echo "  - async_generate: false"
 else
     GRPO_MODE="async"
     IDX=0
@@ -137,6 +154,11 @@ else
     done
     VLLM_DEVICE=$(echo "$VLLM_DEVICE_STRING" | xargs)
     ASYNC_GENERATE="true"
+    echo "=== Using ASYNC mode ==="
+    echo "  - Training and inference use separate GPUs"
+    echo "  - TRAIN_CUDA_LIST: $TRAIN_CUDA_LIST"
+    echo "  - VLLM_DEVICE: $VLLM_DEVICE"
+    echo "  - async_generate: true"
 fi
 
 NPROC_PER_NODE=$(echo $TRAIN_CUDA_LIST | awk -F',' '{print NF}')
@@ -156,14 +178,30 @@ if [ "$GRPO_MODE" = "async" ]; then
       --data_parallel_size 1 \
       --gpu_memory_utilization 0.9 \
       --max_model_len 15000 \
-      --max_num_seqs 64 \
+      --max_num_seqs 128 \
       --host $VLLM_SERVER_HOST \
-      --port $VLLM_SERVER_PORT &
+      --port $VLLM_SERVER_PORT \
+      > "$PRIMUS_OUTPUT_DIR/vllm_server.log" 2>&1 &
+
     VLLM_SERVER_PID=$!
-    trap 'kill $VLLM_SERVER_PID' EXIT
-    sleep 10
+    timeout=$VLLM_SERVER_TIMEOUT
+
+    while ! nc -z "$VLLM_SERVER_HOST" "$VLLM_SERVER_PORT"; do
+        if [ "$timeout" -le 0 ]; then
+            echo "❌ vLLM 未就绪"
+            kill "$VLLM_SERVER_PID"
+            exit 1
+        fi
+
+        timeout=$((timeout - 1))
+        sleep 1
+    done
+
+    echo "✅ vLLM ($VLLM_SERVER_PID) ready"
 fi
 
+# 使用 swift rlhf 而不是直接调用 torchrun
+# ms-swift 会根据环境变量自动判断是否使用 torchrun
 swift rlhf \
     --rlhf_type grpo \
     --model $MODEL_PATH \
@@ -173,7 +211,7 @@ swift rlhf \
     --torch_dtype bfloat16 \
     --external_plugins scripts/rl/v2/orm.py \
     --reward_funcs any_valid_drug_mention drug_only_f1 structure soft_overlong json_integrity \
-    --reward_weights 2.0 2.0 1.0 1.0 1.0 \
+    --reward_weights 1.0 3.0 1.0 1.0 1.0 \
     --num_train_epochs 4 \
     --max_length 9000 \
     --max_completion_length 4096 \
